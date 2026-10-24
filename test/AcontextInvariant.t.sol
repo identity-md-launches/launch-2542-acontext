@@ -8,6 +8,7 @@ import {AcontextToken} from "../src/AcontextToken.sol";
 /// @dev Closed actor set with an independent ledger for all balances and allowances.
 ///      Inputs are bounded using the model, never the token's possibly incorrect state.
 contract AcontextHandler is Test {
+    uint256 private constant SUPPLY = 1_000_000_000 * 10 ** 18;
     AcontextToken private immutable token;
     address[4] public actors = [address(0x1001), address(0x1002), address(0x1003), address(0x1004)];
     mapping(address => uint256) public modelBalance;
@@ -29,6 +30,29 @@ contract AcontextHandler is Test {
     }
 
     function approve(uint256 ownerSeed, uint256 spenderSeed, uint256 amount) external {
+        _approve(ownerSeed, spenderSeed, amount);
+    }
+
+    // Unrestricted uint256 approvals are usually much larger than the supply.
+    // These actions also reach exhaustion, revocation, and the infinite sentinel.
+    function approveFinite(uint256 ownerSeed, uint256 spenderSeed, uint256 amount) external {
+        _approve(ownerSeed, spenderSeed, bound(amount, 0, SUPPLY));
+    }
+
+    function approveInfinite(uint256 ownerSeed, uint256 spenderSeed) external {
+        _approve(ownerSeed, spenderSeed, type(uint256).max);
+    }
+
+    function revokeApproval(uint256 ownerSeed, uint256 spenderSeed) external {
+        _approve(ownerSeed, spenderSeed, 0);
+        address spender = actors[spenderSeed % 4];
+        address owner = actors[ownerSeed % 4];
+        vm.prank(spender);
+        vm.expectRevert(abi.encodeWithSelector(IERC20Errors.ERC20InsufficientAllowance.selector, spender, 0, 1));
+        token.transferFrom(owner, spender, 1);
+    }
+
+    function _approve(uint256 ownerSeed, uint256 spenderSeed, uint256 amount) private {
         address owner = actors[ownerSeed % 4];
         address spender = actors[spenderSeed % 4];
         vm.prank(owner);
@@ -78,8 +102,41 @@ contract AcontextHandler is Test {
         vm.expectRevert(abi.encodeWithSelector(IERC20Errors.ERC20InvalidReceiver.selector, address(0)));
         token.transfer(address(0), 0);
     }
+
+    function attemptDelegatedOverdraw(uint256 fromSeed, uint256 spenderSeed, uint256 toSeed, uint256 amount) external {
+        address from = actors[fromSeed % 4];
+        address spender = actors[spenderSeed % 4];
+        address to = actors[toSeed % 4];
+        uint256 held = modelBalance[from];
+        amount = bound(amount, held + 1, type(uint256).max);
+        _approve(fromSeed, spenderSeed, amount);
+        vm.prank(spender);
+        vm.expectRevert(abi.encodeWithSelector(IERC20Errors.ERC20InsufficientBalance.selector, from, held, amount));
+        token.transferFrom(from, to, amount);
+        // Keep the granted allowance in the model: a failed spend must roll back.
+    }
+
+    function attemptDelegatedZeroReceiver(uint256 fromSeed, uint256 spenderSeed, uint256 amount) external {
+        address from = actors[fromSeed % 4];
+        address spender = actors[spenderSeed % 4];
+        uint256 approved = modelAllowance[from][spender];
+        uint256 held = modelBalance[from];
+        amount = bound(amount, 0, approved < held ? approved : held);
+        vm.prank(spender);
+        vm.expectRevert(abi.encodeWithSelector(IERC20Errors.ERC20InvalidReceiver.selector, address(0)));
+        token.transferFrom(from, address(0), amount);
+    }
+
+    function attemptZeroSpender(uint256 ownerSeed, uint256 amount) external {
+        vm.prank(actors[ownerSeed % 4]);
+        vm.expectRevert(abi.encodeWithSelector(IERC20Errors.ERC20InvalidSpender.selector, address(0)));
+        token.approve(address(0), amount);
+    }
 }
 
+/// forge-config: default.invariant.runs = 256
+/// forge-config: default.invariant.depth = 128
+/// forge-config: default.invariant.fail-on-revert = true
 contract AcontextInvariantTest is Test {
     uint256 private constant SUPPLY = 1_000_000_000_000_000_000_000_000_000;
     AcontextToken private token;
@@ -90,13 +147,19 @@ contract AcontextInvariantTest is Test {
         handler = new AcontextHandler(token);
         assertTrue(token.transfer(handler.actors(0), SUPPLY));
 
-        bytes4[] memory selectors = new bytes4[](6);
+        bytes4[] memory selectors = new bytes4[](12);
         selectors[0] = handler.transfer.selector;
         selectors[1] = handler.approve.selector;
         selectors[2] = handler.transferFrom.selector;
         selectors[3] = handler.attemptOverdraw.selector;
         selectors[4] = handler.attemptUnauthorizedSpend.selector;
         selectors[5] = handler.attemptZeroReceiver.selector;
+        selectors[6] = handler.approveFinite.selector;
+        selectors[7] = handler.approveInfinite.selector;
+        selectors[8] = handler.revokeApproval.selector;
+        selectors[9] = handler.attemptDelegatedOverdraw.selector;
+        selectors[10] = handler.attemptDelegatedZeroReceiver.selector;
+        selectors[11] = handler.attemptZeroSpender.selector;
         targetContract(address(handler));
         targetSelector(FuzzSelector({addr: address(handler), selectors: selectors}));
     }
@@ -123,11 +186,20 @@ contract AcontextInvariantTest is Test {
 
     function invariant_allowancesMatchIndependentLedger() public view {
         for (uint256 i; i < 4; ++i) {
+            assertEq(token.allowance(handler.actors(i), address(0)), 0);
+            assertEq(token.allowance(address(0), handler.actors(i)), 0);
             for (uint256 j; j < 4; ++j) {
                 address owner = handler.actors(i);
                 address spender = handler.actors(j);
                 assertEq(token.allowance(owner, spender), handler.modelAllowance(owner, spender));
             }
         }
+    }
+
+    function invariant_metadataNeverChanges() public view {
+        assertEq(token.name(), "Acontext");
+        assertEq(token.symbol(), "ACON");
+        assertEq(token.decimals(), 18);
+        assertEq(token.INITIAL_SUPPLY(), SUPPLY);
     }
 }
